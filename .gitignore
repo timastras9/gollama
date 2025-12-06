@@ -1,5 +1,5 @@
 # Binaries
-gollama
+/gollama
 *.exe
 *.dll
 *.so
