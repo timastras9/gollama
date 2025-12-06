@@ -76,10 +76,10 @@ func NewTransformer(cfg *Config) *Transformer {
 
 	return &Transformer{
 		Config:     cfg,
-		TokenEmbed: tensor.New(cfg.VocabSize, cfg.HiddenSize),
+		TokenEmbed: tensor.New(cfg.HiddenSize, cfg.VocabSize), // GGUF: [hidden, vocab]
 		Layers:     layers,
 		OutputNorm: NewRMSNorm(cfg.HiddenSize, cfg.NormEps),
-		Output:     tensor.New(cfg.HiddenSize, cfg.VocabSize),
+		Output:     tensor.New(cfg.HiddenSize, cfg.VocabSize), // GGUF: [hidden, vocab]
 		RoPE:       rope,
 	}
 }
@@ -109,21 +109,25 @@ func (t *Transformer) Forward(tokens []int, startPos int) *tensor.Tensor {
 }
 
 // embed looks up token embeddings
+// TokenEmbed is stored as [hidden, vocab] in GGUF, so we read column-wise
 func (t *Transformer) embed(tokens []int) *tensor.Tensor {
 	seqLen := len(tokens)
 	hiddenSize := t.Config.HiddenSize
+	vocabSize := t.Config.VocabSize
 
 	x := tensor.New(seqLen, hiddenSize)
 
 	for i, token := range tokens {
-		if token < 0 || token >= t.Config.VocabSize {
-			panic(fmt.Sprintf("token %d out of range [0, %d)", token, t.Config.VocabSize))
+		if token < 0 || token >= vocabSize {
+			panic(fmt.Sprintf("token %d out of range [0, %d)", token, vocabSize))
 		}
 
-		// Copy embedding for this token
-		srcOffset := token * hiddenSize
+		// TokenEmbed is [hidden, vocab], so column `token` contains the embedding
+		// Read column-wise: element[h] = TokenEmbed[h * vocab + token]
 		dstOffset := i * hiddenSize
-		copy(x.Data[dstOffset:dstOffset+hiddenSize], t.TokenEmbed.Data[srcOffset:srcOffset+hiddenSize])
+		for h := 0; h < hiddenSize; h++ {
+			x.Data[dstOffset+h] = t.TokenEmbed.Data[h*vocabSize+token]
+		}
 	}
 
 	return x
@@ -285,8 +289,43 @@ func (t *Transformer) loadTensor(r *gguf.Reader, name string, dst *tensor.Tensor
 		return err
 	}
 
-	// Dequantize into destination
+	// GGUF stores tensors in row-major order matching our layout
+	// Weight matrices are [rows, cols] where for linear layers:
+	// - Input x is [batch, in_features]
+	// - Weight W is [in_features, out_features]
+	// - Output y = x @ W is [batch, out_features]
 	quant.Dequantize(data, dst.Data, info.Type)
+
+	return nil
+}
+
+// loadTensorTransposed loads a tensor and transposes it
+func (t *Transformer) loadTensorTransposed(r *gguf.Reader, name string, dst *tensor.Tensor) error {
+	info, ok := r.GetTensorInfo(name)
+	if !ok {
+		return fmt.Errorf("tensor not found: %s", name)
+	}
+
+	data, err := r.GetTensorData(name)
+	if err != nil {
+		return err
+	}
+
+	shape := info.Shape()
+	if len(shape) != 2 {
+		return fmt.Errorf("expected 2D tensor for transpose: %s", name)
+	}
+
+	rows, cols := shape[0], shape[1]
+	temp := make([]float32, rows*cols)
+	quant.Dequantize(data, temp, info.Type)
+
+	// Transpose: [rows, cols] -> [cols, rows]
+	for i := 0; i < rows; i++ {
+		for j := 0; j < cols; j++ {
+			dst.Data[j*rows+i] = temp[i*cols+j]
+		}
+	}
 
 	return nil
 }

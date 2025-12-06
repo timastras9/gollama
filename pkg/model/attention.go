@@ -33,16 +33,18 @@ type Attention struct {
 // NewAttention creates a new attention layer
 func NewAttention(cfg *Config, rope *RoPE) *Attention {
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
+	qDim := cfg.NumHeads * cfg.HeadDim
 
 	return &Attention{
 		NumHeads:   cfg.NumHeads,
 		NumKVHeads: cfg.NumKVHeads,
 		HeadDim:    cfg.HeadDim,
 		HiddenSize: cfg.HiddenSize,
-		WQ:         tensor.New(cfg.HiddenSize, cfg.NumHeads*cfg.HeadDim),
-		WK:         tensor.New(cfg.HiddenSize, kvDim),
-		WV:         tensor.New(cfg.HiddenSize, kvDim),
-		WO:         tensor.New(cfg.NumHeads*cfg.HeadDim, cfg.HiddenSize),
+		// GGUF layout: [in_features, out_features] for x @ W
+		WQ:         tensor.New(cfg.HiddenSize, qDim),    // [hidden, qDim]
+		WK:         tensor.New(cfg.HiddenSize, kvDim),   // [hidden, kvDim]
+		WV:         tensor.New(cfg.HiddenSize, kvDim),   // [hidden, kvDim]
+		WO:         tensor.New(qDim, cfg.HiddenSize),    // [qDim, hidden]
 		RoPE:       rope,
 		KeyCache:   tensor.New(cfg.MaxSeqLen, kvDim),
 		ValueCache: tensor.New(cfg.MaxSeqLen, kvDim),
