@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/timastras9/gollama/pkg/model"
 	"github.com/timastras9/gollama/pkg/tokenizer"
 	"github.com/timastras9/gollama/pkg/tools"
+	"github.com/timastras9/gollama/pkg/train"
 )
 
 func main() {
@@ -75,6 +77,20 @@ func main() {
 	pentestTopK := pentestCmd.Int("top-k", 40, "Top-K sampling")
 	pentestTopP := pentestCmd.Float64("top-p", 0.9, "Top-P (nucleus) sampling")
 
+	// Train flags
+	trainCmd := flag.NewFlagSet("train", flag.ExitOnError)
+	trainData := trainCmd.String("data", "", "Path to training data directory")
+	trainTokenizer := trainCmd.String("tokenizer", "", "Path to GGUF file for tokenizer (or leave empty for default)")
+	trainOutput := trainCmd.String("output", "./checkpoints", "Output directory for checkpoints")
+	trainSteps := trainCmd.Int("steps", 10000, "Number of training steps")
+	trainBatch := trainCmd.Int("batch", 4, "Batch size")
+	trainLR := trainCmd.Float64("lr", 3e-4, "Learning rate")
+	trainLayers := trainCmd.Int("layers", 8, "Number of transformer layers")
+	trainHidden := trainCmd.Int("hidden", 512, "Hidden dimension size")
+	trainHeads := trainCmd.Int("heads", 8, "Number of attention heads")
+	trainCtx := trainCmd.Int("ctx", 256, "Context length (block size)")
+	trainCybersec := trainCmd.Bool("cybersec", false, "Use cybersecurity model preset")
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -111,6 +127,16 @@ func main() {
 			os.Exit(1)
 		}
 		runPentest(*pentestModel, *pentestMaxTokens, float32(*pentestTemp), *pentestTopK, float32(*pentestTopP))
+
+	case "train":
+		trainCmd.Parse(os.Args[2:])
+		if *trainData == "" {
+			fmt.Println("Error: --data is required")
+			trainCmd.Usage()
+			os.Exit(1)
+		}
+		runTrain(*trainData, *trainTokenizer, *trainOutput, *trainSteps, *trainBatch,
+			float32(*trainLR), *trainLayers, *trainHidden, *trainHeads, *trainCtx, *trainCybersec)
 
 	case "info":
 		infoCmd.Parse(os.Args[2:])
@@ -153,6 +179,7 @@ Commands:
   run       Run inference on a GGUF model
   chat      Interactive chat session with a model
   pentest   Penetration testing assistant with tool calling
+  train     Train a new LLM from scratch
   info      Show information about a GGUF model
   version   Show version information
   help      Show this help message
@@ -163,6 +190,7 @@ Examples:
   gollama chat --model model.gguf
   gollama --no-gpu chat --model model.gguf   # CPU only
   gollama pentest --model model.gguf
+  gollama train --data ./cybersec_data --cybersec
   gollama info model.gguf
 
 For command-specific help:
@@ -702,3 +730,138 @@ func runPentest(modelPath string, maxTokens int, temp float32, topK int, topP fl
 		fmt.Println()
 	}
 }
+
+func runTrain(dataPath, tokenizerPath, outputPath string, steps, batchSize int,
+	lr float32, numLayers, hiddenSize, numHeads, ctxLen int, cybersec bool) {
+
+	log.Println("╔═══════════════════════════════════════════════════════════╗")
+	log.Println("║  Gollama Training - Build Your Own LLM                    ║")
+	log.Println("╚═══════════════════════════════════════════════════════════╝")
+
+	// Setup config
+	var cfg train.TrainConfig
+	if cybersec {
+		cfg = train.CybersecModelConfig()
+		log.Println("Using cybersecurity model preset (768 hidden, 12 layers)")
+	} else {
+		cfg = train.DefaultTrainConfig()
+		cfg.NumLayers = numLayers
+		cfg.HiddenSize = hiddenSize
+		cfg.NumHeads = numHeads
+		cfg.IntermediateSize = hiddenSize * 11 / 4 // ~2.75x hidden
+	}
+
+	cfg.MaxSteps = steps
+	cfg.BatchSize = batchSize
+	cfg.LearningRate = lr
+	cfg.BlockSize = ctxLen
+	cfg.MaxSeqLen = ctxLen
+	cfg.SavePath = outputPath
+
+	// Load tokenizer
+	var tok *tokenizer.Tokenizer
+	var err error
+
+	if tokenizerPath != "" {
+		log.Printf("Loading tokenizer from %s", tokenizerPath)
+		r, err := gguf.Open(tokenizerPath)
+		if err != nil {
+			log.Fatalf("Failed to open tokenizer file: %v", err)
+		}
+		defer r.Close()
+
+		tok, err = tokenizer.FromGGUF(r)
+		if err != nil {
+			log.Fatalf("Failed to load tokenizer: %v", err)
+		}
+		cfg.VocabSize = tok.VocabSize()
+	} else {
+		// Find any GGUF in models directory for tokenizer
+		models, _ := filepath.Glob("./models/*.gguf")
+		if len(models) > 0 {
+			log.Printf("Loading tokenizer from %s", models[0])
+			r, err := gguf.Open(models[0])
+			if err == nil {
+				tok, err = tokenizer.FromGGUF(r)
+				if err == nil {
+					cfg.VocabSize = tok.VocabSize()
+				}
+				r.Close()
+			}
+		}
+
+		if tok == nil {
+			log.Println("Warning: No tokenizer found, using default vocab size 32000")
+			log.Println("Provide --tokenizer <model.gguf> for proper tokenization")
+		}
+	}
+
+	log.Printf("Vocab size: %d", cfg.VocabSize)
+
+	// Load training data
+	log.Printf("Loading training data from %s", dataPath)
+
+	var tokens []int
+	if tok != nil {
+		if cybersec {
+			// Use cybersecurity-aware dataset
+			csDataset, err := train.NewCybersecDataset(dataPath, tok, cfg.BlockSize)
+			if err != nil {
+				log.Fatalf("Failed to load cybersec dataset: %v", err)
+			}
+			tokens = csDataset.Tokens
+		} else {
+			tokens, err = train.LoadTextDir(dataPath, tok)
+			if err != nil {
+				log.Fatalf("Failed to load training data: %v", err)
+			}
+		}
+	} else {
+		log.Fatal("Cannot train without tokenizer. Provide --tokenizer <model.gguf>")
+	}
+
+	log.Printf("Loaded %d tokens from training data", len(tokens))
+
+	if len(tokens) < cfg.BlockSize*2 {
+		log.Fatalf("Not enough training data. Need at least %d tokens, got %d",
+			cfg.BlockSize*2, len(tokens))
+	}
+
+	// Create dataset and dataloader
+	dataset := train.NewDataset(tokens, cfg.BlockSize)
+	dataLoader := train.NewDataLoader(dataset, cfg.BatchSize, true, 42)
+
+	log.Printf("Dataset size: %d examples", dataset.Len())
+
+	// Create model
+	log.Println("Initializing model...")
+	model := train.NewTrainableModel(cfg)
+
+	// Count parameters
+	totalParams := 0
+	for _, p := range model.Params() {
+		totalParams += len(p.Data)
+	}
+	log.Printf("Model parameters: %.2fM", float64(totalParams)/1e6)
+
+	// Create trainer
+	trainer := train.NewTrainer(model, cfg)
+
+	// Handle interrupts gracefully
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("\nInterrupted! Saving checkpoint...")
+		trainer.SaveCheckpoint()
+		os.Exit(0)
+	}()
+
+	// Start training
+	log.Println("Starting training...")
+	trainer.Train(dataLoader)
+}
+
+// Dummy usage to avoid import errors when train is not used
+var _ = rand.Int

@@ -1,0 +1,33 @@
+# Penetration Testing Guide
+
+## Reconnaissance
+Port scanning is the first step in penetration testing. Use nmap to discover open ports and services.
+Common ports: 22 (SSH), 80 (HTTP), 443 (HTTPS), 3389 (RDP), 3306 (MySQL).
+
+## Vulnerability Assessment
+After reconnaissance, identify vulnerabilities using tools like Nessus, OpenVAS, or Nikto.
+Check for CVEs and known exploits in the discovered services.
+
+## Exploitation
+Metasploit framework provides exploits for many vulnerabilities.
+Always obtain proper authorization before testing.
+Document all findings for the final report.
+
+## Post-Exploitation
+Privilege escalation techniques: kernel exploits, misconfigured SUID binaries, weak credentials.
+Lateral movement: pass-the-hash, pivoting through compromised systems.
+
+## SQL Injection
+SELECT * FROM users WHERE username='admin' AND password='password'
+UNION SELECT null, table_name FROM information_schema.tables--
+Always use parameterized queries to prevent SQL injection.
+
+## XSS Attacks
+Cross-site scripting allows injecting malicious scripts into web pages.
+<script>alert('XSS')</script>
+Use Content-Security-Policy headers and input sanitization.
+
+## Buffer Overflow
+Stack-based buffer overflows exploit memory corruption.
+Return-oriented programming (ROP) bypasses DEP protection.
+ASLR randomizes memory addresses to make exploitation harder.
