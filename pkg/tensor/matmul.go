@@ -22,7 +22,38 @@ func MatMul(a, b *Tensor) *Tensor {
 	}
 
 	out := New(M, N)
-	matmulNaive(a.Data, b.Data, out.Data, M, N, K)
+	numWorkers := runtime.GOMAXPROCS(0)
+
+	// Parallelize for larger matrices
+	if M*N*K > 50000 && M >= numWorkers {
+		var wg sync.WaitGroup
+		rowsPerWorker := (M + numWorkers - 1) / numWorkers
+
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(worker int) {
+				defer wg.Done()
+				startRow := worker * rowsPerWorker
+				endRow := startRow + rowsPerWorker
+				if endRow > M {
+					endRow = M
+				}
+
+				for i := startRow; i < endRow; i++ {
+					for j := 0; j < N; j++ {
+						var sum float32
+						for k := 0; k < K; k++ {
+							sum += a.Data[i*K+k] * b.Data[k*N+j]
+						}
+						out.Data[i*N+j] = sum
+					}
+				}
+			}(w)
+		}
+		wg.Wait()
+	} else {
+		matmulNaive(a.Data, b.Data, out.Data, M, N, K)
+	}
 	return out
 }
 
@@ -125,8 +156,9 @@ func MatMulTransposeB(a, b *Tensor) *Tensor {
 
 	out := New(M, N)
 
-	// Try Metal GPU acceleration for large matrices
-	if metal.IsEnabled() && M*N*K > 50000 {
+	// Try Metal GPU acceleration for very large batch operations
+	// GPU overhead makes it slower for small M (single token inference)
+	if metal.IsEnabled() && M >= 16 && M*N*K > 500000 {
 		err := metal.MatMulTransposed(a.Data, b.Data, out.Data, M, K, N)
 		if err == nil {
 			return out
@@ -134,12 +166,36 @@ func MatMulTransposeB(a, b *Tensor) *Tensor {
 		// Fall back to CPU if Metal fails
 	}
 
-	// Use parallel version for larger matrices
 	numWorkers := runtime.GOMAXPROCS(0)
 
-	// Parallelize over output rows (M) or columns (N), whichever is larger
-	if M >= numWorkers && M*N*K > 100000 {
-		// Parallel over rows
+	// For single-token inference (M=1), parallelize over N (output neurons)
+	if M == 1 && N >= numWorkers {
+		var wg sync.WaitGroup
+		colsPerWorker := (N + numWorkers - 1) / numWorkers
+		aRow := a.Data[:K]
+
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(worker int) {
+				defer wg.Done()
+				startCol := worker * colsPerWorker
+				endCol := startCol + colsPerWorker
+				if endCol > N {
+					endCol = N
+				}
+
+				for j := startCol; j < endCol; j++ {
+					bRow := b.Data[j*K : j*K+K]
+					out.Data[j] = dotProduct(aRow, bRow, K)
+				}
+			}(w)
+		}
+		wg.Wait()
+		return out
+	}
+
+	// For batch inference, parallelize over M (rows)
+	if M > 1 && M*N*K > 50000 {
 		var wg sync.WaitGroup
 		rowsPerWorker := (M + numWorkers - 1) / numWorkers
 
@@ -157,41 +213,49 @@ func MatMulTransposeB(a, b *Tensor) *Tensor {
 					aRow := a.Data[i*K : i*K+K]
 					for j := 0; j < N; j++ {
 						bRow := b.Data[j*K : j*K+K]
-						var sum float32
-						// Unroll loop for better performance
-						k := 0
-						for ; k <= K-4; k += 4 {
-							sum += aRow[k]*bRow[k] + aRow[k+1]*bRow[k+1] + aRow[k+2]*bRow[k+2] + aRow[k+3]*bRow[k+3]
-						}
-						for ; k < K; k++ {
-							sum += aRow[k] * bRow[k]
-						}
-						out.Data[i*N+j] = sum
+						out.Data[i*N+j] = dotProduct(aRow, bRow, K)
 					}
 				}
 			}(w)
 		}
 		wg.Wait()
-	} else {
-		// Sequential for small matrices
-		for i := 0; i < M; i++ {
-			aRow := a.Data[i*K : i*K+K]
-			for j := 0; j < N; j++ {
-				bRow := b.Data[j*K : j*K+K]
-				var sum float32
-				k := 0
-				for ; k <= K-4; k += 4 {
-					sum += aRow[k]*bRow[k] + aRow[k+1]*bRow[k+1] + aRow[k+2]*bRow[k+2] + aRow[k+3]*bRow[k+3]
-				}
-				for ; k < K; k++ {
-					sum += aRow[k] * bRow[k]
-				}
-				out.Data[i*N+j] = sum
-			}
-		}
+		return out
 	}
 
+	// Sequential fallback for tiny matrices
+	for i := 0; i < M; i++ {
+		aRow := a.Data[i*K : i*K+K]
+		for j := 0; j < N; j++ {
+			bRow := b.Data[j*K : j*K+K]
+			out.Data[i*N+j] = dotProduct(aRow, bRow, K)
+		}
+	}
 	return out
+}
+
+// dotProduct computes dot product with 8-way unrolling for better pipelining
+func dotProduct(a, b []float32, K int) float32 {
+	var sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7 float32
+	k := 0
+
+	// 8-way unroll for superscalar execution
+	for ; k <= K-8; k += 8 {
+		sum0 += a[k] * b[k]
+		sum1 += a[k+1] * b[k+1]
+		sum2 += a[k+2] * b[k+2]
+		sum3 += a[k+3] * b[k+3]
+		sum4 += a[k+4] * b[k+4]
+		sum5 += a[k+5] * b[k+5]
+		sum6 += a[k+6] * b[k+6]
+		sum7 += a[k+7] * b[k+7]
+	}
+
+	// Handle remainder
+	sum := sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7
+	for ; k < K; k++ {
+		sum += a[k] * b[k]
+	}
+	return sum
 }
 
 // MatMulParallel performs parallel matrix multiplication

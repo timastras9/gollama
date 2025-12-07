@@ -21,8 +21,21 @@ import (
 )
 
 func main() {
-	// Initialize Metal GPU acceleration
-	if err := metal.Init(); err != nil {
+	// Check for global --no-gpu flag before subcommands
+	noGPU := false
+	for i, arg := range os.Args {
+		if arg == "--no-gpu" || arg == "-no-gpu" {
+			noGPU = true
+			// Remove from args so subcommands don't see it
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			break
+		}
+	}
+
+	// Initialize Metal GPU acceleration (unless disabled)
+	if noGPU {
+		log.Printf("GPU disabled via --no-gpu flag (using CPU only)")
+	} else if err := metal.Init(); err != nil {
 		log.Printf("Metal GPU not available: %v (using CPU)", err)
 	} else {
 		log.Printf("Metal GPU enabled: %s", metal.DeviceName())
@@ -130,7 +143,10 @@ func printUsage() {
 	fmt.Println(`Gollama - Pure Go LLM Inference Engine
 
 Usage:
-  gollama <command> [options]
+  gollama [--no-gpu] <command> [options]
+
+Global Options:
+  --no-gpu    Disable Metal GPU acceleration (CPU only)
 
 Commands:
   serve     Start the Ollama-compatible API server
@@ -145,6 +161,7 @@ Examples:
   gollama serve --addr 127.0.0.1:11434 --models ./models
   gollama run --model model.gguf --prompt "Hello, world!"
   gollama chat --model model.gguf
+  gollama --no-gpu chat --model model.gguf   # CPU only
   gollama pentest --model model.gguf
   gollama info model.gguf
 
