@@ -106,6 +106,36 @@ func matmulBlocked(a, b, c []float32, M, N, K int) {
 	}
 }
 
+// MatMulTransposeB performs matrix multiplication with B transposed: C = A @ B^T
+// A is [M, K], B is [N, K], C is [M, N]
+func MatMulTransposeB(a, b *Tensor) *Tensor {
+	if len(a.Shape) != 2 || len(b.Shape) != 2 {
+		panic("MatMulTransposeB requires 2D tensors")
+	}
+
+	M, K := a.Shape[0], a.Shape[1]
+	N, K2 := b.Shape[0], b.Shape[1]
+
+	if K != K2 {
+		panic("MatMulTransposeB dimension mismatch: A columns must equal B columns")
+	}
+
+	out := New(M, N)
+
+	// C[i,j] = sum_k(A[i,k] * B[j,k])
+	for i := 0; i < M; i++ {
+		for j := 0; j < N; j++ {
+			var sum float32
+			for k := 0; k < K; k++ {
+				sum += a.Data[i*K+k] * b.Data[j*K+k]
+			}
+			out.Data[i*N+j] = sum
+		}
+	}
+
+	return out
+}
+
 // MatMulParallel performs parallel matrix multiplication
 func MatMulParallel(a, b *Tensor) *Tensor {
 	if len(a.Shape) != 2 || len(b.Shape) != 2 {

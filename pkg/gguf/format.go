@@ -187,12 +187,14 @@ func (t *TensorInfo) SizeBytes() uint64 {
 	return numBlocks * uint64(info.TypeSize)
 }
 
-// Shape returns the tensor shape as stored in GGUF
-// For weight matrices this is [n_out, n_in] / [rows, cols]
+// Shape returns the tensor shape in logical order
+// GGUF stores dimensions in reverse order, so we flip them here
+// This gives the shape in standard [rows, cols] / [outer, inner] order
 func (t *TensorInfo) Shape() []int {
-	shape := make([]int, len(t.Dimensions))
+	n := len(t.Dimensions)
+	shape := make([]int, n)
 	for i, d := range t.Dimensions {
-		shape[i] = int(d)
+		shape[n-1-i] = int(d) // Reverse the order
 	}
 	return shape
 }

@@ -24,9 +24,11 @@ func NewFeedForward(hiddenSize, intermediateSize int) *FeedForward {
 	return &FeedForward{
 		HiddenSize:       hiddenSize,
 		IntermediateSize: intermediateSize,
-		WGate:            tensor.New(hiddenSize, intermediateSize),
-		WUp:              tensor.New(hiddenSize, intermediateSize),
-		WDown:            tensor.New(intermediateSize, hiddenSize),
+		// GGUF layout after dimension reversal: [out, in]
+		// We use MatMulTransposeB for x @ W^T
+		WGate: tensor.New(intermediateSize, hiddenSize), // [intermediate, hidden]
+		WUp:   tensor.New(intermediateSize, hiddenSize), // [intermediate, hidden]
+		WDown: tensor.New(hiddenSize, intermediateSize), // [hidden, intermediate]
 	}
 }
 
@@ -34,18 +36,18 @@ func NewFeedForward(hiddenSize, intermediateSize int) *FeedForward {
 // x: [seq_len, hidden_size]
 // Returns: [seq_len, hidden_size]
 func (ff *FeedForward) Forward(x *tensor.Tensor) *tensor.Tensor {
-	// Gate projection: [seq_len, intermediate_size]
-	gate := tensor.MatMul(x, ff.WGate)
+	// Gate projection using transposed weights: [seq_len, intermediate_size]
+	gate := tensor.MatMulTransposeB(x, ff.WGate)
 
-	// Up projection: [seq_len, intermediate_size]
-	up := tensor.MatMul(x, ff.WUp)
+	// Up projection using transposed weights: [seq_len, intermediate_size]
+	up := tensor.MatMulTransposeB(x, ff.WUp)
 
 	// Apply SiLU to gate and multiply with up
 	// hidden = silu(gate) * up
 	ff.siluMulInplace(gate, up)
 
-	// Down projection: [seq_len, hidden_size]
-	return tensor.MatMul(gate, ff.WDown)
+	// Down projection using transposed weights: [seq_len, hidden_size]
+	return tensor.MatMulTransposeB(gate, ff.WDown)
 }
 
 // siluMulInplace computes gate = silu(gate) * up in place

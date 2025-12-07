@@ -76,10 +76,10 @@ func NewTransformer(cfg *Config) *Transformer {
 
 	return &Transformer{
 		Config:     cfg,
-		TokenEmbed: tensor.New(cfg.HiddenSize, cfg.VocabSize), // GGUF: [hidden, vocab]
+		TokenEmbed: tensor.New(cfg.VocabSize, cfg.HiddenSize), // GGUF: [vocab, hidden]
 		Layers:     layers,
 		OutputNorm: NewRMSNorm(cfg.HiddenSize, cfg.NormEps),
-		Output:     tensor.New(cfg.HiddenSize, cfg.VocabSize), // GGUF: [hidden, vocab]
+		Output:     tensor.New(cfg.VocabSize, cfg.HiddenSize), // GGUF: [vocab, hidden]
 		RoPE:       rope,
 	}
 }
@@ -103,13 +103,15 @@ func (t *Transformer) Forward(tokens []int, startPos int) *tensor.Tensor {
 	x = t.OutputNorm.Forward(x)
 
 	// Output projection to vocabulary
-	logits := tensor.MatMul(x, t.Output)
+	// Output is [vocab, hidden], x is [seq, hidden]
+	// logits = x @ Output^T = [seq, vocab]
+	logits := tensor.MatMulTransposeB(x, t.Output)
 
 	return logits.Reshape(seqLen, t.Config.VocabSize)
 }
 
 // embed looks up token embeddings
-// TokenEmbed is stored as [hidden, vocab] in GGUF, so we read column-wise
+// TokenEmbed is [vocab, hidden], so row `token` contains the embedding
 func (t *Transformer) embed(tokens []int) *tensor.Tensor {
 	seqLen := len(tokens)
 	hiddenSize := t.Config.HiddenSize
@@ -122,12 +124,11 @@ func (t *Transformer) embed(tokens []int) *tensor.Tensor {
 			panic(fmt.Sprintf("token %d out of range [0, %d)", token, vocabSize))
 		}
 
-		// TokenEmbed is [hidden, vocab], so column `token` contains the embedding
-		// Read column-wise: element[h] = TokenEmbed[h * vocab + token]
+		// TokenEmbed is [vocab, hidden], row `token` is the embedding
+		// Copy row: element[h] = TokenEmbed[token * hidden + h]
 		dstOffset := i * hiddenSize
-		for h := 0; h < hiddenSize; h++ {
-			x.Data[dstOffset+h] = t.TokenEmbed.Data[h*vocabSize+token]
-		}
+		srcOffset := token * hiddenSize
+		copy(x.Data[dstOffset:dstOffset+hiddenSize], t.TokenEmbed.Data[srcOffset:srcOffset+hiddenSize])
 	}
 
 	return x
@@ -262,13 +263,14 @@ func (t *Transformer) loadWeights(r *gguf.Reader) error {
 	}
 
 	// Output projection - may be tied to embeddings
+	// GGUF stores output as [hidden, vocab], we use MatMulTransposeB so keep as-is
 	outputKey := "output.weight"
 	if _, ok := r.GetTensorInfo(outputKey); ok {
 		if err := t.loadTensor(r, outputKey, t.Output); err != nil {
 			return err
 		}
 	} else {
-		// Tie output to embeddings (transpose)
+		// Tie output to embeddings
 		t.tieOutputToEmbedding()
 	}
 
@@ -330,15 +332,7 @@ func (t *Transformer) loadTensorTransposed(r *gguf.Reader, name string, dst *ten
 	return nil
 }
 
-// tieOutputToEmbedding sets output weights equal to transposed embeddings
+// tieOutputToEmbedding copies embedding weights to output (both [hidden, vocab])
 func (t *Transformer) tieOutputToEmbedding() {
-	vocabSize := t.Config.VocabSize
-	hiddenSize := t.Config.HiddenSize
-
-	// Output is [hidden_size, vocab_size], embed is [vocab_size, hidden_size]
-	for i := 0; i < hiddenSize; i++ {
-		for j := 0; j < vocabSize; j++ {
-			t.Output.Data[i*vocabSize+j] = t.TokenEmbed.Data[j*hiddenSize+i]
-		}
-	}
+	copy(t.Output.Data, t.TokenEmbed.Data)
 }

@@ -40,11 +40,12 @@ func NewAttention(cfg *Config, rope *RoPE) *Attention {
 		NumKVHeads: cfg.NumKVHeads,
 		HeadDim:    cfg.HeadDim,
 		HiddenSize: cfg.HiddenSize,
-		// GGUF layout: [in_features, out_features] for x @ W
-		WQ:         tensor.New(cfg.HiddenSize, qDim),    // [hidden, qDim]
-		WK:         tensor.New(cfg.HiddenSize, kvDim),   // [hidden, kvDim]
-		WV:         tensor.New(cfg.HiddenSize, kvDim),   // [hidden, kvDim]
-		WO:         tensor.New(qDim, cfg.HiddenSize),    // [qDim, hidden]
+		// GGUF layout after dimension reversal: [out_features, in_features]
+		// We use MatMulTransposeB for x @ W^T
+		WQ:         tensor.New(qDim, cfg.HiddenSize),    // [qDim, hidden]
+		WK:         tensor.New(kvDim, cfg.HiddenSize),   // [kvDim, hidden]
+		WV:         tensor.New(kvDim, cfg.HiddenSize),   // [kvDim, hidden]
+		WO:         tensor.New(cfg.HiddenSize, qDim),    // [hidden, qDim]
 		RoPE:       rope,
 		KeyCache:   tensor.New(cfg.MaxSeqLen, kvDim),
 		ValueCache: tensor.New(cfg.MaxSeqLen, kvDim),
@@ -58,10 +59,11 @@ func NewAttention(cfg *Config, rope *RoPE) *Attention {
 func (a *Attention) Forward(x *tensor.Tensor, startPos int) *tensor.Tensor {
 	seqLen := x.Shape[0]
 
-	// Project to Q, K, V
-	q := tensor.MatMul(x, a.WQ) // [seq_len, num_heads * head_dim]
-	k := tensor.MatMul(x, a.WK) // [seq_len, num_kv_heads * head_dim]
-	v := tensor.MatMul(x, a.WV) // [seq_len, num_kv_heads * head_dim]
+	// Project to Q, K, V using transposed weights
+	// x @ W^T where W is [out, in] gives [seq, out]
+	q := tensor.MatMulTransposeB(x, a.WQ) // [seq_len, num_heads * head_dim]
+	k := tensor.MatMulTransposeB(x, a.WK) // [seq_len, num_kv_heads * head_dim]
+	v := tensor.MatMulTransposeB(x, a.WV) // [seq_len, num_kv_heads * head_dim]
 
 	// Reshape for multi-head attention
 	// Q: [seq_len, num_heads, head_dim]
@@ -87,8 +89,8 @@ func (a *Attention) Forward(x *tensor.Tensor, startPos int) *tensor.Tensor {
 	// Compute attention for each head
 	output := a.computeAttention(q, fullK, fullV, startPos, seqLen, cacheLen)
 
-	// Output projection
-	return tensor.MatMul(output, a.WO)
+	// Output projection using transposed weights
+	return tensor.MatMulTransposeB(output, a.WO)
 }
 
 // updateCache updates the KV-cache with new K, V values

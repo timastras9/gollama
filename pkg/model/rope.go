@@ -63,6 +63,7 @@ func (r *RoPE) Apply(q, k *tensor.Tensor, startPos int) {
 }
 
 // apply2D applies RoPE to a 2D tensor [seq_len, head_dim]
+// Uses consecutive pairing: (x[2i], x[2i+1]) pairs
 func (r *RoPE) apply2D(x *tensor.Tensor, startPos int) {
 	seqLen := x.Shape[0]
 	headDim := x.Shape[1]
@@ -70,19 +71,20 @@ func (r *RoPE) apply2D(x *tensor.Tensor, startPos int) {
 
 	for pos := 0; pos < seqLen; pos++ {
 		absPos := startPos + pos
+		baseIdx := pos * headDim
 
 		for i := 0; i < halfDim; i++ {
 			cos := r.FreqsCos.At(absPos, i)
 			sin := r.FreqsSin.At(absPos, i)
 
-			// Get the pair of values to rotate
-			idx0 := pos*headDim + i*2
-			idx1 := pos*headDim + i*2 + 1
+			// Consecutive pairs: (x[2i], x[2i+1])
+			idx0 := baseIdx + 2*i
+			idx1 := baseIdx + 2*i + 1
 
 			x0 := x.Data[idx0]
 			x1 := x.Data[idx1]
 
-			// Apply rotation: [cos, -sin; sin, cos] @ [x0, x1]
+			// Apply rotation
 			x.Data[idx0] = x0*cos - x1*sin
 			x.Data[idx1] = x0*sin + x1*cos
 		}
@@ -90,6 +92,7 @@ func (r *RoPE) apply2D(x *tensor.Tensor, startPos int) {
 }
 
 // apply3D applies RoPE to a 3D tensor [seq_len, num_heads, head_dim]
+// Uses consecutive pairing: (x[2i], x[2i+1]) pairs
 func (r *RoPE) apply3D(x *tensor.Tensor, startPos int) {
 	seqLen := x.Shape[0]
 	numHeads := x.Shape[1]
@@ -100,14 +103,15 @@ func (r *RoPE) apply3D(x *tensor.Tensor, startPos int) {
 		absPos := startPos + pos
 
 		for h := 0; h < numHeads; h++ {
+			baseIdx := pos*numHeads*headDim + h*headDim
+
 			for i := 0; i < halfDim; i++ {
 				cos := r.FreqsCos.At(absPos, i)
 				sin := r.FreqsSin.At(absPos, i)
 
-				// Calculate indices
-				baseIdx := pos*numHeads*headDim + h*headDim
-				idx0 := baseIdx + i*2
-				idx1 := baseIdx + i*2 + 1
+				// Consecutive pairs: (x[2i], x[2i+1])
+				idx0 := baseIdx + 2*i
+				idx1 := baseIdx + 2*i + 1
 
 				x0 := x.Data[idx0]
 				x1 := x.Data[idx1]
