@@ -3,6 +3,8 @@ package tensor
 import (
 	"runtime"
 	"sync"
+
+	"github.com/timastras9/gollama/pkg/metal"
 )
 
 // MatMul performs matrix multiplication: C = A @ B
@@ -108,6 +110,7 @@ func matmulBlocked(a, b, c []float32, M, N, K int) {
 
 // MatMulTransposeB performs matrix multiplication with B transposed: C = A @ B^T
 // A is [M, K], B is [N, K], C is [M, N]
+// Uses Metal GPU acceleration when available, falls back to parallel CPU
 func MatMulTransposeB(a, b *Tensor) *Tensor {
 	if len(a.Shape) != 2 || len(b.Shape) != 2 {
 		panic("MatMulTransposeB requires 2D tensors")
@@ -122,14 +125,69 @@ func MatMulTransposeB(a, b *Tensor) *Tensor {
 
 	out := New(M, N)
 
-	// C[i,j] = sum_k(A[i,k] * B[j,k])
-	for i := 0; i < M; i++ {
-		for j := 0; j < N; j++ {
-			var sum float32
-			for k := 0; k < K; k++ {
-				sum += a.Data[i*K+k] * b.Data[j*K+k]
+	// Try Metal GPU acceleration for large matrices
+	if metal.IsEnabled() && M*N*K > 50000 {
+		err := metal.MatMulTransposed(a.Data, b.Data, out.Data, M, K, N)
+		if err == nil {
+			return out
+		}
+		// Fall back to CPU if Metal fails
+	}
+
+	// Use parallel version for larger matrices
+	numWorkers := runtime.GOMAXPROCS(0)
+
+	// Parallelize over output rows (M) or columns (N), whichever is larger
+	if M >= numWorkers && M*N*K > 100000 {
+		// Parallel over rows
+		var wg sync.WaitGroup
+		rowsPerWorker := (M + numWorkers - 1) / numWorkers
+
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(worker int) {
+				defer wg.Done()
+				startRow := worker * rowsPerWorker
+				endRow := startRow + rowsPerWorker
+				if endRow > M {
+					endRow = M
+				}
+
+				for i := startRow; i < endRow; i++ {
+					aRow := a.Data[i*K : i*K+K]
+					for j := 0; j < N; j++ {
+						bRow := b.Data[j*K : j*K+K]
+						var sum float32
+						// Unroll loop for better performance
+						k := 0
+						for ; k <= K-4; k += 4 {
+							sum += aRow[k]*bRow[k] + aRow[k+1]*bRow[k+1] + aRow[k+2]*bRow[k+2] + aRow[k+3]*bRow[k+3]
+						}
+						for ; k < K; k++ {
+							sum += aRow[k] * bRow[k]
+						}
+						out.Data[i*N+j] = sum
+					}
+				}
+			}(w)
+		}
+		wg.Wait()
+	} else {
+		// Sequential for small matrices
+		for i := 0; i < M; i++ {
+			aRow := a.Data[i*K : i*K+K]
+			for j := 0; j < N; j++ {
+				bRow := b.Data[j*K : j*K+K]
+				var sum float32
+				k := 0
+				for ; k <= K-4; k += 4 {
+					sum += aRow[k]*bRow[k] + aRow[k+1]*bRow[k+1] + aRow[k+2]*bRow[k+2] + aRow[k+3]*bRow[k+3]
+				}
+				for ; k < K; k++ {
+					sum += aRow[k] * bRow[k]
+				}
+				out.Data[i*N+j] = sum
 			}
-			out.Data[i*N+j] = sum
 		}
 	}
 

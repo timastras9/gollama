@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/timastras9/gollama/pkg/gguf"
 	"github.com/timastras9/gollama/pkg/quant"
@@ -206,6 +207,7 @@ func (t *Transformer) loadWeights(r *gguf.Reader) error {
 
 	// Load each layer
 	for i := 0; i < t.Config.NumLayers; i++ {
+		log.Printf("  Loading layer %d/%d...", i+1, t.Config.NumLayers)
 		layer := t.Layers[i]
 		prefix := fmt.Sprintf("blk.%d.", i)
 

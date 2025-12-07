@@ -2,6 +2,8 @@ package model
 
 import (
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/timastras9/gollama/pkg/tensor"
 )
@@ -107,6 +109,7 @@ func (a *Attention) updateCache(k, v *tensor.Tensor, startPos, seqLen int) {
 }
 
 // computeAttention computes scaled dot-product attention with GQA support
+// Parallelized over attention heads
 func (a *Attention) computeAttention(q, fullK, fullV *tensor.Tensor, startPos, seqLen, cacheLen int) *tensor.Tensor {
 	output := tensor.New(seqLen, a.NumHeads*a.HeadDim)
 	scale := float32(1.0 / math.Sqrt(float64(a.HeadDim)))
@@ -114,62 +117,91 @@ func (a *Attention) computeAttention(q, fullK, fullV *tensor.Tensor, startPos, s
 	// Number of Q heads per KV head (for GQA)
 	headsPerKV := a.NumHeads / a.NumKVHeads
 
-	// Process each query position
-	for pos := 0; pos < seqLen; pos++ {
-		absPos := startPos + pos
-
-		// Process each head
-		for h := 0; h < a.NumHeads; h++ {
-			// Determine which KV head to use
-			kvHead := h / headsPerKV
-
-			// Get query vector for this head
-			qOffset := pos*a.NumHeads*a.HeadDim + h*a.HeadDim
-			qVec := q.Data[qOffset : qOffset+a.HeadDim]
-
-			// Compute attention scores for all cached positions
-			scores := make([]float32, cacheLen)
-			maxScore := float32(math.Inf(-1))
-
-			for kPos := 0; kPos <= absPos; kPos++ { // Causal mask: only attend to past and current
-				kOffset := kPos*a.NumKVHeads*a.HeadDim + kvHead*a.HeadDim
-				kVec := fullK.Data[kOffset : kOffset+a.HeadDim]
-
-				// Dot product
-				var dot float32
-				for i := 0; i < a.HeadDim; i++ {
-					dot += qVec[i] * kVec[i]
-				}
-				scores[kPos] = dot * scale
-
-				if scores[kPos] > maxScore {
-					maxScore = scores[kPos]
-				}
-			}
-
-			// Softmax (only over valid positions)
-			var sumExp float32
-			for kPos := 0; kPos <= absPos; kPos++ {
-				scores[kPos] = float32(math.Exp(float64(scores[kPos] - maxScore)))
-				sumExp += scores[kPos]
-			}
-			for kPos := 0; kPos <= absPos; kPos++ {
-				scores[kPos] /= sumExp
-			}
-
-			// Weighted sum of values
-			outOffset := pos*a.NumHeads*a.HeadDim + h*a.HeadDim
-			for i := 0; i < a.HeadDim; i++ {
-				var sum float32
-				for vPos := 0; vPos <= absPos; vPos++ {
-					vOffset := vPos*a.NumKVHeads*a.HeadDim + kvHead*a.HeadDim
-					sum += scores[vPos] * fullV.Data[vOffset+i]
-				}
-				output.Data[outOffset+i] = sum
-			}
-		}
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers > a.NumHeads {
+		numWorkers = a.NumHeads
 	}
 
+	var wg sync.WaitGroup
+	headsPerWorker := (a.NumHeads + numWorkers - 1) / numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+
+			startHead := worker * headsPerWorker
+			endHead := startHead + headsPerWorker
+			if endHead > a.NumHeads {
+				endHead = a.NumHeads
+			}
+
+			// Pre-allocate scores buffer for this worker
+			scores := make([]float32, cacheLen)
+
+			// Process each query position
+			for pos := 0; pos < seqLen; pos++ {
+				absPos := startPos + pos
+
+				// Process assigned heads
+				for h := startHead; h < endHead; h++ {
+					// Determine which KV head to use
+					kvHead := h / headsPerKV
+
+					// Get query vector for this head
+					qOffset := pos*a.NumHeads*a.HeadDim + h*a.HeadDim
+					qVec := q.Data[qOffset : qOffset+a.HeadDim]
+
+					// Compute attention scores for all cached positions
+					maxScore := float32(math.Inf(-1))
+
+					for kPos := 0; kPos <= absPos; kPos++ {
+						kOffset := kPos*a.NumKVHeads*a.HeadDim + kvHead*a.HeadDim
+						kVec := fullK.Data[kOffset : kOffset+a.HeadDim]
+
+						// Dot product with loop unrolling
+						var dot float32
+						i := 0
+						for ; i <= a.HeadDim-4; i += 4 {
+							dot += qVec[i]*kVec[i] + qVec[i+1]*kVec[i+1] + qVec[i+2]*kVec[i+2] + qVec[i+3]*kVec[i+3]
+						}
+						for ; i < a.HeadDim; i++ {
+							dot += qVec[i] * kVec[i]
+						}
+						scores[kPos] = dot * scale
+
+						if scores[kPos] > maxScore {
+							maxScore = scores[kPos]
+						}
+					}
+
+					// Softmax (only over valid positions)
+					var sumExp float32
+					for kPos := 0; kPos <= absPos; kPos++ {
+						scores[kPos] = float32(math.Exp(float64(scores[kPos] - maxScore)))
+						sumExp += scores[kPos]
+					}
+					invSum := 1.0 / sumExp
+					for kPos := 0; kPos <= absPos; kPos++ {
+						scores[kPos] *= invSum
+					}
+
+					// Weighted sum of values
+					outOffset := pos*a.NumHeads*a.HeadDim + h*a.HeadDim
+					for i := 0; i < a.HeadDim; i++ {
+						var sum float32
+						for vPos := 0; vPos <= absPos; vPos++ {
+							vOffset := vPos*a.NumKVHeads*a.HeadDim + kvHead*a.HeadDim
+							sum += scores[vPos] * fullV.Data[vOffset+i]
+						}
+						output.Data[outOffset+i] = sum
+					}
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
 	return output
 }
 
